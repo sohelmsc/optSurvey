@@ -1,0 +1,252 @@
+/*  =================================================================================
+ *  Name        : Optsurvey.cpp
+ *  Author      : Sohel Bhuiyan
+ *  Version     : 1.0
+ *  Purpose     : Optimum survey design. Here we have moved the receiver and source
+ *  			: line in inline and X-line directions. We have decimated receiver
+ *  			: and source lines only.
+ *
+ *  Date        : February 11, 2015
+ *  Affiliation : University of Alberta, Physics department, (SAIG)
+ *  Email       : mbhuiyan@ualberta.ca
+ * ===================================================================================
+ */
+
+#include "Params.hpp"
+#include "OperationalParams.hpp"
+#include "GeophyParams.hpp"
+#include "ReconstructParams.hpp"
+#include "Survey.hpp"
+
+int main()
+{
+   clock_t start, finish;
+   float binSize[3];
+   int count=0;
+
+   /** Creating the objects of the dependence classes ************************************/
+   OperationalParams opp;
+   GeophyParams gpp;
+   ReconstructParams rpp;
+   Params params;
+   Survey sur;
+
+   /** Parameters for simulation and initial ACQ design **********************************/
+   params.fMax = 36;   			// Hz
+   params.fDom = 18;    		// Hz
+   params.vAve = 2200; 			// (m/s)
+   params.vMax = 2500; 			// (m/s)
+   params.vMin = 1800; 			// (m/s)
+   params.depthSurvey = 1500;	// (m)
+   params.targetSize = 100;		// (m)
+   params.depthShHorizon = 160;	// (m)
+   params.surveySizeX = 3000;   // (m)
+   params.surveySizeY = 3000;   // (m)
+   params.constraintNum = 6;    // Number of constraint
+
+   // Compute bin size parameter /////
+   binSize[0] = params.targetSize/3;
+   binSize[1] = params.vAve/(4*params.fDom);
+   binSize[2] = params.vMin/(4*params.fMax);
+
+   /** Initialisation of Geophysical parameters. **************************************/
+   gpp.desXmax = 1.4*params.depthSurvey;
+   gpp.desXmin = 1.4*params.depthShHorizon;
+   gpp.binX = *std::min_element(binSize, binSize+3);
+   gpp.binY = gpp.binX;
+
+   /** Initialisation of Operational parameters. **************************************/
+   opp.RI = 2*gpp.binX;				  					 // Receiver interval (m)
+   opp.SI = 2*gpp.binY;				  					 // Source interval (m)
+   opp.RLI = round((1/sqrtf(5.0))*gpp.desXmin);	  			 // Receiver line interval (m)
+   opp.SLI = 2*opp.RLI;				  					 // Source line interval (m)
+   opp.NRL = ceil(params.surveySizeY/opp.RLI);  		 // Number of receiver line
+   opp.NSL = ceil(params.surveySizeX/opp.SLI);   		 // Number of source line
+   opp.NR = ceil(params.surveySizeX/opp.RI)*opp.NRL;     // Total number of receivers in the whole survey
+   opp.NS = ceil(params.surveySizeY/opp.SI)*opp.NSL;     // Total number of sources in the whole survey
+   opp.initSlOffset = opp.RI/2;							  //  Source line offset from the first receiver
+
+   /** Initialisation of Reconstructional parameters. *********************************/
+   rpp.desiredGridDensity = 0.2;
+   rpp.desiredCriticGridDensity = 0.0;
+   rpp.desCriticalMu = 0.0;
+   rpp.desiredGridEfficiency = 1;
+   opp.recAvail = 6400;
+
+   // Initialising Lagrangian multipliers *********************************************/
+   params.gamma = new float [params.constraintNum];
+   params.theta = sur.alloc2DPointerFloat(20, params.constraintNum , params.theta);
+   for(int i=0;i<params.constraintNum;i++)
+   	   params.gamma[i] = 0.2;
+   for(int j=0;j<20;j++)
+	   for(int i=0;i<params.constraintNum;i++)
+		   params.theta[j][i] = 0.2;
+
+   // Initialisation of windowing parameters
+   params.winX = 80;
+   params.winY = 60;
+   params.winHx = 45;
+   params.winHy = 100;
+   params.winAz = 4;
+   params.olapHx = (int) round(params.winHx*0.3);
+   params.olapHy = 20;
+   params.olapX = (int) round(params.winX*0.3);
+   params.olapY = (int) round(params.winY*0.3);
+   params.olapAz = (int) round(params.winAz*0.3);
+
+   /** Initial ACQ design parameters. ******************************************************/
+   params.templateExist = 0;
+   params.tempLenX = 2*gpp.desXmax/sqrt(5);				 // Template length in X direction
+   params.tempLenY = gpp.desXmax/sqrt(5);				 // Template length in Y direction
+   params.tempNR = ceil(params.tempLenX/(2*gpp.binX))+1; // Number of receivers in one template line
+   params.tempNRL = ceil(params.tempLenY/(opp.RLI))+1;   // Number of receiver line in the template
+
+   params.srcLineDecimationRate = 0.5;					  // Rate of decimation in source line
+   params.srcDecimationRate = 1.0;						  // Rate of decimation in source line
+
+   params.recDecimationRate = 0.5;						  // Rate of decimation in receiver line
+
+   opp.decNRL = round(opp.NRL * params.recDecimationRate);    // Decimated number of receiver line
+   params.intervalRec = round((opp.NRL-1)/(opp.decNRL - 1));  // Receiver line interval
+   params.allowedMovementRec = 1;                              // Predefined based on decimation and receiver perturbation
+
+   opp.decNSL = round(opp.NSL * params.srcLineDecimationRate);    // Decimated number of source line
+   opp.decNS = round(ceil(params.surveySizeY/opp.SI) * params.srcDecimationRate);    // Decimated number of sources in one line
+
+   params.intervalSrcLine = round((opp.NSL-1)/(opp.decNSL - 1));  // Source line interval
+   params.intervalSrc = round((ceil(params.surveySizeX/opp.SI)-1)/(opp.decNS - 1));  // Sources interval in one line
+   params.allowedMovementSrcLine = 1;                              // Predefined based on decimation and source perturbation
+   params.allowedMovementSrc = 1;                              // Predefined based on decimation and source perturbation
+
+   // If every source is listened by every receiver
+   if(params.templateExist != 1)
+   {
+   	  params.tempLenX = params.surveySizeX;				 // Template length in X direction
+   	  params.tempLenY = params.surveySizeY;				 // Template length in Y direction
+   	  params.tempNR = params.surveySizeX/opp.RI; 		// Number of receivers in one template line
+   	  params.tempNRL = opp.decNRL;   					// Number of receiver line in the template
+   }
+
+   // Allocating memory for 2D pointer of src and receiver locations *******************//
+   params.recLoc = sur.alloc2DPointer(opp.decNRL*ceil(params.surveySizeX/opp.RI), 2, params.recLoc);
+   params.srcLoc = sur.alloc2DPointer(opp.decNSL*opp.decNS, 2, params.srcLoc);
+
+   // Initialisation and Optimisation parameters for shots and receivers ***************//
+   params.rec = sur.alloc2DPointer(opp.NRL, ceil(params.surveySizeX/opp.RI), params.rec);
+   params.src = sur.alloc2DPointer(opp.NSL, ceil(params.surveySizeY/opp.SI), params.src);
+
+   //** Source and receiver distribution **********************************************
+   for(int i=0; i<opp.NRL;i++)
+	   for(int j=0; j<ceil(params.surveySizeX/opp.RI);j++)
+		   params.rec[i][j] = 0;
+
+   for(int i=0; i<opp.NSL;i++)
+   	   for(int j=0; j<ceil(params.surveySizeY/opp.SI);j++)
+   		   params.src[i][j] = 0;
+
+   opp.maxRLI = params.intervalRec;
+   opp.maxSLI = params.intervalSrc;
+
+   opp.minRLI = params.intervalRec;
+   opp.minSLI = params.intervalSrc;
+
+   //** Decimated receiver distribution ********************/
+   for(int i=0; i<opp.NRL; i+=params.intervalRec)
+   {
+	   if(i>opp.NRL)
+		   i = opp.NRL;
+   	   for(int j=0; j<ceil(params.surveySizeX/opp.RI); j++)
+   	   {
+   		   params.recLoc[count][0]=i;   // Receiver line
+   		   params.recLoc[count][1]=j;	// Receiver location in that line
+   		   params.rec[i][j] = 1;
+   		   count++;
+   	   }
+   }
+
+   params.totRec = count;
+   count = 0;
+
+   //** Decimated source distribution ********************/
+   for(int i=0; i<opp.NSL; i+=params.intervalSrcLine)
+   {
+	   if(i>opp.NSL)
+	   		 i = opp.NSL;
+	   for(int j=0; j<ceil(params.surveySizeY/opp.SI); j+=params.intervalSrc)
+	   {
+		   params.srcLoc[count][0]=i;   // Source line
+		   params.srcLoc[count][1]=j;   // Source number in source line
+		   params.src[i][j] = 1;
+		   count++;
+	   }
+   }
+   params.totSrc = count;
+   params.perturbRecNode = 1;
+   params.perturbSrcNode = 1;
+   params.salvo = (ceil) ((params.intervalRec*opp.RLI)/opp.SI)+1;			// Number of shot before the movement of the template
+   params.dh = 70;		  							// Size of offset bin (meter)
+   params.daz = 45;       							// Size of azimuth bin (degree)
+   params.numthreads = 1;
+
+   // Display message ********************************* //
+   std::cout <<"Acquisition parameters for ideal case: " <<std::endl;
+   std::cout <<"--------------------------------------" <<std::endl;
+   std::cout <<"Total number of required receivers: " << opp.NR <<std::endl;
+   std::cout <<"Total number of required sources: " << opp.NS <<std::endl;
+   std::cout <<"Receiver interval: " << opp.RI <<std::endl;
+   std::cout <<"Receiver line interval: " << opp.RLI <<std::endl;
+   std::cout <<"Source interval: " << opp.SI <<std::endl;
+   std::cout <<"Source line interval: " << opp.SLI <<std::endl;
+   std::cout <<"Required least number of available receivers (based on maximum offset and target depth) or template size: " << params.tempNR * params.tempNRL <<std::endl;
+   std::cout <<"Swath shooting path will be provided after the simulation: " << params.tempNR * params.tempNRL <<std::endl;
+   std::cout <<"Simulation started ... ..." <<std::endl;
+
+   // SA parameters
+   params.numCycle =30;
+   params.initTemp = 100;
+
+   // Survey design parameters
+   params.surType = ORTHO;
+
+   // File name to save *******************************************/
+   params.swathShootTrac = "swathShootingFile.csv";
+   params.srcGeo = "sourceGeoFile.csv";
+   params.recGeo = "receiverGeoFile.csv";
+   params.convergence1 = "saConvergence.csv";
+   params.convergence2 = "aulConvergence.csv";
+   params.mutualCoherency = "mutualCoherency.csv";
+   params.simGridDensity = "simGridDensity.csv";
+   params.initMutualCoherency = "initMutualCoherency.csv";
+   params.initSimGridDensity = "initSimGridDensity.csv";
+   params.otherInfo = "otherInfo.csv";
+   params.finalFitness = "finalFitness.csv";
+
+   params.convergenceSAconstraint = NULL;
+   params.convergenceSAconstraint = new float[params.numCycle+1];
+
+   /** Executing ACQ design optimisation algorithm ******************/
+   start = clock();
+   sur.findOptSurvey(&params, &gpp, &rpp, &opp);
+   finish = clock();
+   std::cout << "Time: " << (finish-start)/double(CLOCKS_PER_SEC) << " Seconds " <<std::endl;
+
+   // Writing the files *******************************************************************/
+   sur.write2Ddata(params.swathShootTrac, params.totSrc, 2, params.firstLocRecTem);
+   sur.write2Ddata(params.recGeo, opp.NRL, ceil(params.surveySizeX/opp.RI), params.rec);
+   sur.write2Ddata(params.srcGeo, opp.NSL, ceil(params.surveySizeY/opp.SI), params.src);
+   sur.write1Ddata(params.mutualCoherency, params.totPatches, rpp.mu);
+   sur.write1Ddata(params.simGridDensity, params.totPatches, rpp.simGridDensity);
+   sur.write1Ddata(params.initMutualCoherency, params.totPatches, rpp.initMu);
+   sur.write1Ddata(params.initSimGridDensity, params.totPatches, rpp.initSimGridDensity);
+   sur.write1Ddata(params.convergence1, params.numCycle, params.convergenceSAconstraint);
+   sur.writeDdata(params.otherInfo, &params, &gpp, &rpp, 1);
+   sur.writeDdata(params.finalFitness, &params, &gpp, &rpp, 0);
+
+   /** Clearing the memory space **********************************************************/
+   params.reset();
+   opp.reset();
+   gpp.reset();
+   rpp.reset();
+   std::cout << "Cleared the memory space." <<std::endl;
+ return 0;
+}

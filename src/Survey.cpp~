@@ -1,0 +1,1338 @@
+/*  =================================================================================
+ *  Name        : Survey.cpp
+ *  Author      : Sohel Bhuiyan
+ *  Version     : 0.1
+ *  Purpose     : Execute methods to find optimum survey
+ *  Date        : Feb 12, 2015
+ *  Affiliation : University of Alberta, Physics department (SAIG)
+ *  Email       : mbhuiyan@ualberta.ca
+ * ===================================================================================
+ */
+
+#include <cmath>
+#include <algorithm>
+using ::std::sort;
+#include <stdlib.h>
+#include <vector>
+#include <iostream>
+using std::cout;
+using std::ofstream;
+using std::endl;
+#include <fstream>
+#include <string>
+
+#include <complex.h>
+#include "fftw3.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "Params.hpp"
+#include "GeophyParams.hpp"
+#include "OperationalParams.hpp"
+#include "ReconstructParams.hpp"
+#include "Survey.hpp"
+
+#define PI 3.1415926535897932
+
+/***** Core method to optimise 3D seismic survey *****************/
+void Survey::findOptSurvey(Params* params, GeophyParams* gpp,ReconstructParams* rpp, OperationalParams* opp)
+{
+	int j = 0, totSrcInLine, totRecInLine, CMPOffsetFlag = 1, count = 0;
+	std::vector<int> indx;
+	float alpha = 1.1, beta = 1.1, epsilon = 0.1, tempMax1, tempMax2, eqConstraint[3], uneqConstraint[3], kNew, k = 100000.0;
+	clock_t start, finish;
+	params->firstLocRecTem = alloc2DPointer(params->totSrc, 2,params->firstLocRecTem);
+	totSrcInLine = params->totSrc / opp->decNSL;
+	totRecInLine = params->totRec / opp->decNRL;
+	computeCMPOffset(params, opp, gpp, rpp,CMPOffsetFlag, -1, totRecInLine,totSrcInLine, 10000);
+	computeBinning(params, gpp, rpp);
+	computePatch(params, gpp, rpp, 0);
+	params->fitness = evalFitness(params, gpp, rpp, opp->maxRLI, opp->RLI, opp->maxSLI, opp->SLI, j);
+	params->finalCons.push_back(params->fitness);
+
+	while(1) {
+
+		if(count >=5)
+			break;
+
+		indx.clear();
+		start = clock();
+		SA(params, gpp, rpp, opp, j);
+		finish = clock();
+		std::cout << "Time: " << (finish-start)/double(CLOCKS_PER_SEC) << " Seconds " <<std::endl;
+		eqConstraint[0] = rpp->simCriticalMu;
+		eqConstraint[1] = rpp->simCriticGridDensity;
+		eqConstraint[2] = params->normGridEfficiency;
+		tempMax1 = *std::max_element(eqConstraint, eqConstraint + 3);
+		uneqConstraint[0] =(params->tempNormMin > -params->theta[j][2])?fabs(params->tempNormMin) : fabs(params->theta[j][2]);
+		uneqConstraint[1] =(params->tempNormMax > -params->theta[j][3])?fabs(params->tempNormMax) : fabs(params->theta[j][3]);
+		uneqConstraint[2] =(params->tempGridDensity > -params->theta[j][5])?fabs(params->tempGridDensity):fabs(params->theta[j][5]);
+
+		tempMax2 = *std::max_element(uneqConstraint, uneqConstraint + 3);
+		kNew = (tempMax1 > tempMax2) ? tempMax1 : tempMax2;
+
+		if (uneqConstraint[0] > k / alpha)
+			indx.push_back(2);
+		if (uneqConstraint[1] > k / alpha)
+			indx.push_back(3);
+		if (uneqConstraint[2] > k / alpha)
+			indx.push_back(5);
+		if (eqConstraint[0] > k / alpha)
+			indx.push_back(0);
+		if (eqConstraint[1] > k / alpha)
+			indx.push_back(1);
+		if (eqConstraint[2] > k / alpha)
+			indx.push_back(4);
+
+		if (kNew <= epsilon)
+			break;
+		else
+		{
+			if (kNew >= k)
+			{
+				for (unsigned int i = 0; i < indx.size(); i++)
+				{
+					params->gamma[indx[i]] = params->gamma[indx[i]] * beta;
+					params->theta[j][indx[i]] = params->theta[j][indx[i]] / beta;
+				}
+			}
+			else
+			{
+				for (unsigned int i = 0; i < indx.size(); i++)
+				{
+					if (indx[i] == 2)
+						params->theta[j + 1][indx[i]] = params->theta[j][indx[i]]+(params->tempNormMin> -params->theta[j][indx[i]]) ?(params->tempNormMin):(-params->theta[j][indx[i]]);
+					else if (indx[i] == 3)
+						params->theta[j + 1][indx[i]] =	params->theta[j][indx[i]]+ (params->tempNormMax> -params->theta[j][3])?(params->tempNormMax):(-params->theta[j][3]);
+					else if (indx[i] == 5)
+						params->theta[j + 1][indx[i]] =	params->theta[j][indx[i]]+ (params->tempGridDensity	> -params->theta[j][5]) ?(params->tempGridDensity) :(-params->theta[j][5]);
+					else if (indx[i] == 0)
+						params->theta[j + 1][indx[i]] = params->theta[j][indx[i]]+ rpp->simCriticalMu;
+					else if (indx[i] == 1)
+						params->theta[j + 1][indx[i]] = params->theta[j][indx[i]]+ rpp->simCriticGridDensity;
+					else
+						params->theta[j + 1][indx[i]] = params->theta[j][indx[i]]+ params->normGridEfficiency;
+				}
+				if(kNew <= (k / alpha))
+				{
+					k = kNew;
+					j++;
+				}
+				else
+				{
+					for (unsigned int i = 0; i < indx.size(); i++)
+					{
+						params->gamma[indx[i]] = params->gamma[indx[i]] * beta;
+						params->theta[j + 1][indx[i]] = params->theta[j + 1][indx[i]] / beta;
+					}
+					k = kNew;
+					j++;
+				}
+			}
+		}
+
+		std::cout << kNew << std::endl;
+
+		params->finalCons.push_back(params->convergenceSAunconstraint);
+
+		std::cout << "Outer Loop: " << j << std::endl;
+
+		count++;
+
+		if (j >= 1)
+			break;
+	}
+	// To deallocate memory space ***************************
+	deallocPointer(params->binDimX, params->binDimY, params->offsetDim, params->binning);
+	params->binning = NULL;
+}
+
+/***** Allocate 2D pointer ***************************************/
+int ** Survey::alloc2DPointer(int n1, int n2, int **data) {
+	if (!(data = new int *[n1])) {
+		std::cout << " Error out of memory " << std::endl;
+		exit(1);
+	} else {
+		for (int i = 0; i < n1; i++)
+			data[i] = new int[n2];
+	}
+	return data;
+}
+
+/***** Allocate 2D pointer ***************************************/
+float ** Survey::alloc2DPointerFloat(int n1, int n2, float **data) {
+	if (!(data = new float *[n1])) {
+		std::cout << " Error out of memory " << std::endl;
+		exit(1);
+	} else {
+		for (int i = 0; i < n1; i++)
+			data[i] = new float[n2];
+	}
+	return data;
+}
+
+/***** Allocate 4D pointer ***************************************/
+int **** Survey::alloc4DPointer(int n1, int n2, int n3, int n4, int ****data) {
+	int i, j, k, l;
+
+	data = new int ***[n1];
+	if (!(data = new int ***[n1])) {
+		std::cout << " Error: out of memory " << std::endl;
+		exit(1);
+	} else {
+		for (i = 0; i < n1; i++) {
+			data[i] = new int**[n2];
+			for (j = 0; j < n2; j++) {
+				data[i][j] = new int*[n3];
+				for (k = 0; k < n3; k++) {
+					data[i][j][k] = new int[n4];
+					for (l = 0; l < n4; l++) {
+						data[i][j][k][l] = 0;
+					}
+				}
+			}
+		}
+	}
+	return data;
+}
+
+/***** Allocate 4D pointer ***************************************/
+void Survey::deallocPointer(int n1, int n2, int n3, int ****data)
+{
+	int i, j, k;
+	for (i = 0; i < n1; i++)
+		for (j = 0; j < n2; j++)
+			for (k = 0; k < n3; k++)
+			{
+				delete [] data[i][j][k];
+				data[i][j][k] = NULL;
+			}
+	delete [] data;
+	data = NULL;
+}
+
+/***** Implementing SA ***********************************************************/
+void Survey::SA(Params* params, GeophyParams* gpp, ReconstructParams* rpp,	OperationalParams* opp, int outLoopCount)
+{
+	float currTemp, r, diffFitness, fitness;
+	int numCycle = 1, *indxSrc, *indxRec, preLoc, currLoc, totSrcInLine,totRecInLine, *indxSrcLoc, *preIndxSrcLoc;
+	int CMPOffsetFlag = 1;
+
+	//** Initial source and receiver locations ***********************************/
+	indxRec = findLinLoc(params->rec, opp->NRL);
+	indxSrc = findLinLoc(params->src, opp->NSL);
+	totSrcInLine = params->totSrc / opp->decNSL;
+	totRecInLine = params->totRec / opp->decNRL;
+
+	//End of Data Initialisation *************************************************/
+	params->convergenceSAconstraint[0] = params->fitness; // cost_function;
+	while(numCycle <= params->numCycle)
+	{
+		std::cout << numCycle << std::endl;
+		currTemp = params->initTemp * powf(0.99, (1 + numCycle));
+
+		// Looping over number of source line ************************************/
+		for (int j=0; j<opp->decNSL; j++)
+		{
+			if(params->srcLineDecimationRate < 1.0 && params->srcDecimationRate < 1.0)
+			{
+				// Find the previous source line location ******/
+				preLoc = indxSrc[j];
+
+				// Find the current source position in a particular source line before changing position ***/
+				preIndxSrcLoc = findSrcLoc(params->src,ceil(params->surveySizeY/opp->SI),preLoc);
+
+				// Rearrange the source position in a particular source line ******/
+				indxSrcLoc = permSrcLoc(params->allowedMovementSrc, params->intervalSrc, (totSrcInLine - 1), ceil(params->surveySizeY/opp->SI));
+
+				// Find the new source line location ******/
+				currLoc = findLoc(j, indxSrc, params->allowedMovementSrcLine, params->intervalSrcLine, (opp->decNSL - 1), preLoc, opp->NSL);
+
+				// IF current location is changed *************************************/
+				indxSrc[j] = currLoc;
+				if (currLoc != preLoc)
+				{
+					if (j > 0)
+						//opp->maxSLI = ((indxSrc[j] - indxSrc[j-1]) > opp->maxSLI) ?(indxSrc[j] - indxSrc[j - 1]) : opp->maxSLI;
+						opp->minSLI = ((indxRec[j] - indxRec[j-1]) < opp->minSLI) ? (indxRec[j] - indxRec[j-1]) : opp->minSLI;
+					for (int k = 0; k < totSrcInLine; k++)
+					{
+						params->src[preLoc][preIndxSrcLoc[k]] = 0;
+						params->src[currLoc][indxSrcLoc[k]] = 1;
+						params->srcLoc[j * totSrcInLine +k][0] = currLoc;
+						params->srcLoc[j * totSrcInLine +k][1] = indxSrcLoc[k];
+					}
+				}
+				else
+				{
+					for (int k = 0; k < totSrcInLine; k++)
+					{
+
+						params->src[currLoc][preIndxSrcLoc[k]] = 0;
+						params->src[currLoc][indxSrcLoc[k]] = 1;
+						params->srcLoc[j * totSrcInLine+k][1] = indxSrcLoc[k];
+					}
+				}
+
+				CMPOffsetFlag = 0;
+				computeCMPOffset(params, opp, gpp, rpp,CMPOffsetFlag, currLoc,	totRecInLine, totSrcInLine, j);
+
+				//fitness = evalFitness(params, gpp, rpp,opp->maxRLI, opp->RLI, opp->maxSLI, opp->SLI, outLoopCount);
+
+				fitness = evalFitness(params, gpp, rpp,opp->minRLI, opp->RLI, opp->minSLI, opp->SLI, outLoopCount);
+				diffFitness = fitness - params->fitness;
+
+				// Metropolis criteria  ******************//
+				r = ((double) rand() / (RAND_MAX));
+				if (diffFitness < 0 || (r < (expf(-diffFitness / currTemp))))
+					params->fitness = fitness;
+				else {
+					indxSrc[j] = preLoc;
+					for (int k = 0; k < totSrcInLine; k++)
+					{
+						params->src[preLoc][preIndxSrcLoc[k]] = 1;
+						params->src[currLoc][indxSrcLoc[k]] = 0;
+						params->srcLoc[j * totSrcInLine +k][0] = preLoc;
+						params->srcLoc[j * totSrcInLine +k][1] = preIndxSrcLoc[k];
+
+					}
+				}
+			}
+
+			else if(params->srcDecimationRate < 1.0)
+			{
+				// Find the current source position in a particular source line before changing position ***/
+				preIndxSrcLoc = findSrcLoc(params->src,ceil(params->surveySizeY/opp->SI),indxSrc[j]);
+
+				// Rearrange the source position in a particular source line ******/
+				indxSrcLoc = permSrcLoc(params->allowedMovementSrc, params->intervalSrc, (totSrcInLine - 1), ceil(params->surveySizeY/opp->SI));
+
+				for (int k=0; k<totSrcInLine;k++)
+				{
+					params->src[j][preIndxSrcLoc[k]] = 0;
+					params->src[j][indxSrcLoc[k]] = 1;
+					params->srcLoc[j * totSrcInLine +k][1] = indxSrcLoc[k];
+				}
+
+				CMPOffsetFlag = 0;
+				computeCMPOffset(params, opp, gpp, rpp,CMPOffsetFlag, currLoc,	totRecInLine, totSrcInLine, j);
+
+				//fitness = evalFitness(params, gpp, rpp,opp->maxRLI, opp->RLI, opp->maxSLI, opp->SLI, outLoopCount);
+				fitness = evalFitness(params, gpp, rpp,opp->minRLI, opp->RLI, opp->minSLI, opp->SLI, outLoopCount);
+				diffFitness = fitness - params->fitness;
+
+				// Metropolis criteria  ******************//
+				r = ((double) rand() / (RAND_MAX));
+				if (diffFitness < 0 || (r < (expf(-diffFitness / currTemp))))
+					params->fitness = fitness;
+				else {
+					indxSrc[j] = preLoc;
+					for (int k=0; k<totSrcInLine; k++)
+					{
+						params->src[j][preIndxSrcLoc[k]] = 1;
+						params->src[j][indxSrcLoc[k]] = 0;
+						params->srcLoc[j*totSrcInLine+k][1] = preIndxSrcLoc[k];
+					}
+				}
+			}
+
+			else
+			{
+				preLoc = indxSrc[j];
+				currLoc = findLoc(j, indxSrc, params->allowedMovementSrcLine, params->intervalSrcLine, (opp->decNSL - 1), preLoc, opp->NSL);
+
+				// IF current location is changed *************************************/
+				indxSrc[j] = currLoc;
+				if (currLoc != preLoc)
+				{
+					if (j > 0)
+						//opp->maxSLI = ((indxSrc[j] - indxSrc[j-1]) > opp->maxSLI) ?(indxSrc[j] - indxSrc[j - 1]) : opp->maxSLI;
+						opp->minSLI = ((indxRec[j] - indxRec[j-1]) < opp->minSLI) ? (indxRec[j] - indxRec[j-1]) : opp->minSLI;
+					for (int k = 0; k < totSrcInLine; k++)
+					{
+						params->src[preLoc][k] = 0;
+						params->src[currLoc][k] = 1;
+						params->srcLoc[j * totSrcInLine + k][0] = currLoc;
+					}
+					CMPOffsetFlag = 0;
+					computeCMPOffset(params, opp, gpp, rpp,CMPOffsetFlag, currLoc,	totRecInLine, totSrcInLine, j);
+
+					//fitness = evalFitness(params, gpp, rpp,opp->maxRLI, opp->RLI, opp->maxSLI, opp->SLI, outLoopCount);
+					fitness = evalFitness(params, gpp, rpp,opp->minRLI, opp->RLI, opp->minSLI, opp->SLI, outLoopCount);
+					diffFitness = fitness - params->fitness;
+
+					// Metropolis criteria  ******************//
+					r = ((double) rand() / (RAND_MAX));
+					if (diffFitness < 0 || (r < (expf(-diffFitness / currTemp))))
+						params->fitness = fitness;
+					else {
+						indxSrc[j] = preLoc;
+						for (int k = 0; k < totSrcInLine; k++)
+						{
+							params->src[preLoc][k] = 1;
+							params->src[currLoc][k] = 0;
+							params->srcLoc[j * totSrcInLine + k][0] = preLoc;
+						}
+					}
+				}
+			} // End of else
+    	} // End of for loop
+
+		// Looping over number of receiver line *********
+		for (int j = 0; j < opp->decNRL; j++)
+		{
+			preLoc = indxRec[j];
+			currLoc = findLoc(j, indxRec, params->allowedMovementRec,params->intervalRec, (opp->decNRL - 1), preLoc, opp->NRL);
+
+			// IF current location is changed ************//
+			indxRec[j] = currLoc;
+			if (currLoc != preLoc) {
+				if (j > 0)
+					//opp->maxRLI = ((indxRec[j] - indxRec[j-1]) > opp->maxRLI) ? (indxRec[j] - indxRec[j-1]) : opp->maxRLI;
+					opp->minRLI = ((indxRec[j] - indxRec[j-1]) < opp->minRLI) ? (indxRec[j] - indxRec[j-1]) : opp->minRLI;
+
+				for (int k=0; k < totRecInLine; k++) {
+					params->rec[preLoc][k] = 0;
+					params->rec[currLoc][k] = 1;
+					params->recLoc[j * totRecInLine + k][0] = currLoc;
+				}
+				CMPOffsetFlag = 2;
+				computeCMPOffset(params, opp, gpp, rpp,CMPOffsetFlag, currLoc,	totRecInLine, totSrcInLine, j);
+				//fitness = evalFitness(params, gpp, rpp, opp->maxRLI, opp->RLI, opp->maxSLI, opp->SLI, outLoopCount);
+				fitness = evalFitness(params, gpp, rpp,opp->minRLI, opp->RLI, opp->minSLI, opp->SLI, outLoopCount);
+				diffFitness = fitness - params->fitness;
+
+				// Minimization Problem *****************************//
+				r = ((double) rand() / (RAND_MAX));
+				if (diffFitness < 0 || (r < (expf(-diffFitness / currTemp))))
+					params->fitness = fitness;
+				else {
+					indxRec[j] = preLoc;
+					for (int k = 0; k < totRecInLine; k++) {
+						params->rec[preLoc][k] = 1;
+						params->rec[currLoc][k] = 0;
+						params->recLoc[j * totRecInLine + k][0] = preLoc;
+					}
+				}
+			}
+		}
+		params->convergenceSAconstraint[numCycle] = fitness;
+		numCycle = numCycle + 1;
+	}
+	params->convergenceSAunconstraint =	params->convergenceSAconstraint[numCycle-1];
+}
+
+/**** Find the next location of sources and receivers  */
+int Survey::findLoc(int j, int *indx, int allowedMovement, int inter, int deciStationLine, int preLoc, int totalStationLine)
+{
+	// Defining whether the perturbation will be decimal or integer number ***********//
+	int numDigit = 0, count = 0, currLoc, flag;
+
+	float perturb, r;
+
+	r = ((float) rand() / (RAND_MAX));
+
+	// Compute the current receiver location ****************************//
+	if (j == 0) {
+		perturb = round((r * allowedMovement / 2 * pow(10, numDigit)))/ pow(10, numDigit);
+		currLoc = inter * (j) + perturb;
+	} else if (j > 0) {
+		perturb = round((r * allowedMovement * pow(10, numDigit)))/ pow(10, numDigit);
+		currLoc = inter * (j) + perturb - floor(allowedMovement / 2);
+	} else if (j == deciStationLine) {
+		perturb = round((r * allowedMovement * pow(10, numDigit)))
+				/ pow(10, numDigit);
+		currLoc = inter * (j) + perturb - floor(allowedMovement / 2);
+	}
+
+	// Infinity loop until a new location is found ************************
+	while (1) {
+		flag = 0;
+		for (int k = 0; k <= deciStationLine; k++)
+			if (indx[k] == currLoc) {
+				flag = 1;
+				break;
+			}
+
+		if (flag == 0 && currLoc < totalStationLine)
+			break;
+		else {
+			if (j == 0) {
+				perturb = round((r * allowedMovement / 2 * pow(10, numDigit)))/ pow(10, numDigit);
+				currLoc = inter * (j) + perturb;
+			} else if (j > 0) {
+				perturb = round((r * allowedMovement * pow(10, numDigit)))/ pow(10, numDigit);
+				currLoc = inter * (j) + perturb - floor(allowedMovement / 2);
+			} else if (j == sizeof(indx) / sizeof(int) - 1) {
+				perturb = round((r * allowedMovement * pow(10, numDigit)))	/ pow(10, numDigit);
+				currLoc = inter * (j) + perturb - floor(allowedMovement / 2);
+			}
+			count = count + 1;
+			if (count > 20) {
+				currLoc = preLoc;
+				break;
+			}
+		}
+	}
+	return currLoc;
+}
+
+int * Survey::permSrcLoc(int allowedMovementSrc, int inter, int srcNum , int totalSrc)
+{
+	// Defining whether the perturbation will be decimal or integer number ***********//
+	int numDigit = 0, count = 0, currLoc, flag, *p;
+	float perturb, r;
+
+	p = (int *) malloc(sizeof(int) * (srcNum+1));
+
+	// Compute the current source location ****************************//
+	for(int j=0; j<=srcNum; j++)
+	{
+		r = ((float) rand() / (RAND_MAX));
+		if (j == 0) {
+			perturb = round((r * allowedMovementSrc / 2 * pow(10, numDigit)))/ pow(10, numDigit);
+			currLoc = inter * (j) + perturb;
+		} else if (j > 0) {
+			perturb = round((r * allowedMovementSrc * pow(10, numDigit)))/ pow(10, numDigit);
+			currLoc = inter * (j) + perturb - floor(allowedMovementSrc / 2);
+		} else if (j == srcNum)
+		{
+			perturb = round((r * allowedMovementSrc * pow(10, numDigit)))/ pow(10, numDigit);
+			currLoc = inter * (j) + perturb - floor(allowedMovementSrc / 2);
+		}
+		if(currLoc >= totalSrc)
+			p[j] = totalSrc-1;
+		else
+			p[j] = currLoc;
+	}
+
+	return p;
+}
+
+//** Find critical portion of data set *********************************************/
+float Survey::standardization(float *data, float avg, int totPatch)
+{
+	int i, count = 0;
+	float sum = 0.0, criticalData, stdData, temp;
+
+	for(i = 0; i < totPatch; i++)
+		sum += powf((data[i] - avg), 2);
+
+	stdData = sqrtf((sum / totPatch));
+
+	for (i = 0; i < totPatch; i++) {
+		temp = ((data[i] - avg) / stdData) - 1;
+		if (temp > 0.0)
+			count++;
+	}
+	criticalData = (float) (count/totPatch);
+
+	return criticalData;
+}
+
+//** Find the location of source or receiver lines *********************************************/
+inline int* Survey::findLinLoc(int **Lineloc, int length) {
+	int *p, i, count = 0;
+	p = (int *) malloc(sizeof(int) * length);
+	for (i = 0; i < length; i++)
+		if (Lineloc[i][0] == 1) {
+			p[count] = i;
+			count++;
+		}
+	return p;
+}
+
+//** Find sources in one line *************************************************************/
+inline int* Survey::findSrcLoc(int **Lineloc, int length, int lineNum) {
+
+	int *p, i, count = 0;
+	p = (int *) malloc(sizeof(int) * length);
+	for (i = 0; i < length; i++)
+		if (Lineloc[lineNum][i] == 1) {
+			p[count] = i;
+			count++;
+		}
+	return p;
+}
+
+// *** Compute CMPOffset domain *****************************************************/
+void Survey::computeCMPOffset(Params* params, OperationalParams* opp, GeophyParams* gpp, ReconstructParams* rpp, int flag, int currLoc,int totRecInLine, int totSrcInLine, int currLinNum)
+{
+	int i, preRecLoc, count = 0, countSalvo, chkSalvoY, chkSalvoX,countSrcLine = 0, minPatchNum = 100000;
+	int temMovementX, tempLoc, indx, imx, imy, ih, iaz, endWinX, endWinY, endOffset, endAz, maxPatchNum=-10;
+	float offsetx, offsety, radtodeg = 180/M_PI, azimuth, sumMu = 0.0, sumGridDensity = 0.0;
+	long int countPopBin = 0;
+
+	//** Computing Mutual coherency *************************//
+	if (flag == 1)
+	{
+		//** For all sources in the acquisition design. This is done only once at the beginning.
+		for (i = 0; i < params->totSrc; i++)
+		{
+			params->cmpX.push_back(std::vector<std::vector<float> >());
+			count = 0;
+
+			// ** Find the starting location of receiver template for the first source of a source line ********
+			if(params->templateExist == 1)
+			{
+				if (i % (totSrcInLine) == 0)
+				{
+					countSalvo = 0;
+					if (countSrcLine == 0)
+					{
+						params->firstLocRecTem[i][0] = 0;/// Store the receiver line
+						params->firstLocRecTem[i][1] = 0;/// Store the receiver number
+					}
+					// *** shifting receiver template towards right direction ***************************
+					else if ((params->firstLocRecTem[i - 1][1] * opp->RI+ params->tempLenX / 2)	< params->srcLoc[i][0] * opp->SLI)
+					{
+						temMovementX = ceil((params->srcLoc[i][0] * opp->SLI- (params->firstLocRecTem[i - 1][1]	* opp->RI + params->tempLenX / 2))/ opp->RI) + 1;
+						chkSalvoX = (params->firstLocRecTem[i - 1][1] + temMovementX+ params->tempNR - totRecInLine);
+						params->firstLocRecTem[i][1] =(params->firstLocRecTem[i - 1][1] + temMovementX)- (chkSalvoX > 0 ? chkSalvoX : 0);/// Store the receiver number
+
+						// For up going source direction **************************
+						if (!(countSrcLine % 2))
+							params->firstLocRecTem[i][0] = 0;/// Store the receiver line number
+
+						// For down going source direction ************************
+						else
+							params->firstLocRecTem[i][0] = opp->decNRL - 1;	/// Store the receiver line number
+
+					} else {
+						params->firstLocRecTem[i][1] = params->firstLocRecTem[i - 1][1];/// Store the receiver number
+
+						// For up going source direction **************************
+						if (!(countSrcLine % 2))
+							params->firstLocRecTem[i][0] = 0;/// Store the receiver line number
+
+						// For down going source direction ************************
+						else
+							params->firstLocRecTem[i][0] = opp->decNRL - 1;	/// Store the receiver line number
+					}
+					countSrcLine++;
+				}
+
+				//** Find the starting location of receiver template  ********
+				else if ((countSalvo + 1) >= params->salvo)
+				{
+					// For up going source direction *************************
+					if (countSrcLine % 2)
+					{
+						chkSalvoY = (params->firstLocRecTem[i-1][0] +1+ params->tempNRL - opp->decNRL);
+						if (chkSalvoY <= 0)
+							params->firstLocRecTem[i][0] = params->firstLocRecTem[i-1][0] + 1;/// Store the receiver number line
+						else
+							params->firstLocRecTem[i][0] = params->firstLocRecTem[i-1][0];	/// Store the receiver number line
+					}
+
+					// For down going source direction **************************
+					else {
+						chkSalvoY = (params->firstLocRecTem[i - 1][0]- params->tempNRL + 1);
+						if (chkSalvoY > 0)
+							params->firstLocRecTem[i][0] = params->firstLocRecTem[i- 1][0] - 1;/// Store the receiver number line
+						else
+							params->firstLocRecTem[i][0] = params->firstLocRecTem[i- 1][0];	/// Store the receiver number line
+					}
+					params->firstLocRecTem[i][1] = params->firstLocRecTem[i - 1][1];/// Store the receiver number
+					countSalvo = 0;
+				}
+				else
+				{
+					params->firstLocRecTem[i][0] = params->firstLocRecTem[i - 1][0];/// Store the receiver number
+					params->firstLocRecTem[i][1] = params->firstLocRecTem[i - 1][1];/// Store the receiver number
+					countSalvo++;
+				}
+			}
+			else  // If every source is listened by every receiver
+			{
+				params->firstLocRecTem[i][0] = 0;/// Store the receiver line
+				params->firstLocRecTem[i][1] = 0;/// Store the receiver number
+			}
+
+			// Traversing the receiver template from lower to higher receivers ******************************
+			for (int j = 0; j < params->tempNRL; j++)
+			{
+				if(params->templateExist == 1)
+				{
+					// For up going source direction **************************
+					if (countSrcLine % 2)
+						tempLoc = (params->firstLocRecTem[i][0] + j);
+
+					// For down going source direction **************************
+					else
+						tempLoc = (params->firstLocRecTem[i][0] - j);
+				}
+				else
+					tempLoc = (params->firstLocRecTem[i][0] + j);
+
+				preRecLoc = tempLoc * totRecInLine;
+
+				for (int k = 0; k < params->tempNR; k++) {
+
+					params->cmpX[i].push_back(std::vector<float>());
+
+					params->cmpX[i][count].push_back(((params->srcLoc[i][0] * opp->SLI+ opp->initSlOffset)+ (params->recLoc[preRecLoc + k][1])*opp->RI) / 2); // CMPX
+
+					params->cmpX[i][count].push_back(tempLoc);   						  // RLN
+
+					params->cmpX[i][count].push_back(params->firstLocRecTem[i][1] + k);	  // RN
+
+					params->cmpXVal.push_back(((params->srcLoc[i][0] * opp->SLI+ opp->initSlOffset)+ (params->recLoc[preRecLoc + k][1])* opp->RI) / 2);  // CMP-X
+
+					params->cmpY.push_back((params->srcLoc[i][1] * opp->SI+ (tempLoc) * opp->RLI) / 2);  // CMP-Y
+
+                    offsetx = (params->recLoc[preRecLoc + k][1]) * opp->RI - (params->srcLoc[i][0] * opp->SLI+ opp->initSlOffset); // hx = Rx - Sx
+
+                    offsety = (tempLoc) * opp->RLI - params->srcLoc[i][1] * opp->SI;  // hy =  Ry - Sy
+
+					params->offSet.push_back(sqrt(powf(offsetx, 2) + powf(offsety, 2)));	//offset
+
+					azimuth = (atan2(offsety, offsetx) * radtodeg);
+
+					params->aziMuth.push_back(azimuth < 0 ? azimuth + 360 : azimuth); // Azimuth
+
+					count++;
+				}
+			}
+		}
+	}
+
+	//** For the perturbation of one source line in the acquisition design *********************
+	else if (flag == 0)
+	{
+		if (currLinNum > 0)
+		{
+			if(params->templateExist == 1)
+			{
+				if ((params->firstLocRecTem[currLinNum * totSrcInLine - 1][1]* opp->RI + params->tempLenX / 2)< params->srcLoc[currLinNum * totSrcInLine][0] * opp->SLI)
+				{
+					temMovementX = ceil((params->srcLoc[currLinNum * totSrcInLine][0] * opp->SLI- (params->firstLocRecTem[currLinNum* totSrcInLine - 1][1] * opp->RI+ params->tempLenX / 2)) / opp->RI) + 1;
+					chkSalvoX = (params->firstLocRecTem[currLinNum * totSrcInLine- 1][1] + temMovementX + params->tempNR - totRecInLine);
+					params->firstLocRecTem[currLinNum * totSrcInLine][1] = (params->firstLocRecTem[currLinNum * totSrcInLine - 1][1]+ temMovementX)- (chkSalvoX > 0 ? chkSalvoX : 0);/// Store the receiver number
+				}
+			}
+			else
+			{
+				params->firstLocRecTem[currLinNum * totSrcInLine][1] = 0;
+			}
+		}
+		for (int m = 0; m < totSrcInLine; m++) {
+			count = 0;
+			for (int j = 0; j < params->tempNRL; j++)
+			{
+				if(params->templateExist == 1)
+				{
+					// For up going template movement *********************************
+					if (!(currLinNum % 2))
+						tempLoc =(params->firstLocRecTem[currLinNum * totSrcInLine][0]+ j);  // Current receiver line number
+
+					// For down going template movement ********************************
+					else
+						tempLoc = (params->firstLocRecTem[currLinNum * totSrcInLine][0]- j);  // Current receiver line number
+				}
+				else
+				{
+					tempLoc = (params->firstLocRecTem[currLinNum * totSrcInLine][0] + j);
+				}
+
+				preRecLoc = tempLoc * totRecInLine;
+
+				// Traversing every receiver in that receiver line *****************
+				for (int k = 0; k < params->tempNR; k++) {
+
+					// Turn off the previous trace in that bin *************/
+					ih = floor(params->offSet[currLinNum * totSrcInLine * params->tempNRL* params->tempNR	+ m * (params->tempNRL * params->tempNR) + count] / params->dh);
+					imx = floor(params->cmpXVal[currLinNum * totSrcInLine * params->tempNRL* params->tempNR	+ m * (params->tempNRL * params->tempNR) + count] / gpp->binX);
+					imy = floor(params->cmpY[currLinNum * totSrcInLine * params->tempNRL* params->tempNR	+ m * (params->tempNRL * params->tempNR) + count] / gpp->binY);
+					iaz = floor(params->aziMuth[currLinNum * totSrcInLine * params->tempNRL* params->tempNR	+ m * (params->tempNRL * params->tempNR) + count] / params->daz);
+
+					ih = (ih>=params->offsetDim)?params->offsetDim-1:ih;
+
+					if (params->binning[imx][imy][ih][iaz] == 1)
+					{
+						params->binning[imx][imy][ih][iaz] = 0;
+						params->cmpOffsetBinPopulate--;
+
+						// Turn off this trace located in different patches ***********/
+						for(int q=0; q<params->totPatches; q++)
+						{
+							endWinX = (params->patchTrack[q][0]+2*params->winX-1-params->olapX)<params->binDimX?(params->patchTrack[q][0]+params->winX):params->binDimX;
+							endWinY = (params->patchTrack[q][1]+2*params->winY-1-params->olapY)<params->binDimY?(params->patchTrack[q][1]+params->winY):params->binDimY;
+							endOffset = (params->patchTrack[q][2]+2*params->winHx-1-params->olapHx)<params->offsetDim?(params->patchTrack[q][2]+params->winHx):params->offsetDim;
+							endAz = (params->patchTrack[q][3]+2*params->winAz-1-params->olapAz)<params->azDim?(params->patchTrack[q][3]+params->winAz):params->azDim;
+
+							if(imx>endWinX && imy>endWinY && ih>endOffset && iaz>endAz)
+								break;
+							if((imx >= params->patchTrack[q][0] && imx < endWinX) && (imy >= params->patchTrack[q][1] && imy < endWinY) && (ih >= params->patchTrack[q][2] && ih < endOffset)&& (iaz >= params->patchTrack[q][3] && iaz < endAz))
+							{
+								params->patch4D[q][imx-params->patchTrack[q][0]][imy-params->patchTrack[q][1]][ih-params->patchTrack[q][2]][iaz-params->patchTrack[q][3]] = 0;
+								maxPatchNum = (maxPatchNum<q)?q:maxPatchNum;
+								minPatchNum = (minPatchNum>q)?q:minPatchNum;
+							}
+
+						}// End Turn off this trace located in different patches *******/
+					}
+
+					params->cmpX[currLinNum * totSrcInLine + m][count][0] =(((params->srcLoc[currLinNum * totSrcInLine + m][0]* opp->SLI + opp->initSlOffset)+ (params->recLoc[preRecLoc + k][1])* opp->RI) / 2); // CMPX
+
+					params->cmpX[currLinNum * totSrcInLine + m][count][2] =	(params->firstLocRecTem[currLinNum * totSrcInLine+ m][1] + k);	  // RN
+
+					params->cmpXVal[currLinNum * totSrcInLine * params->tempNRL* params->tempNR	+ m * (params->tempNRL * params->tempNR) + count] =(((params->srcLoc[currLinNum * totSrcInLine + m][0]* opp->SLI + opp->initSlOffset)+ (params->recLoc[preRecLoc + k][1])* opp->RI) / 2);  // CMP-Y
+
+					params->cmpY[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count] =((params->srcLoc[currLinNum * totSrcInLine + m][1]* opp->SI+ (params->recLoc[preRecLoc + k][0])* opp->RLI) / 2);  // CMP-Y
+
+                    offsetx = (params->recLoc[preRecLoc + k][1]) * opp->RI - (params->srcLoc[currLinNum * totSrcInLine + m][0]* opp->SLI + opp->initSlOffset); // hx
+
+                    offsety =  (params->recLoc[preRecLoc + k][0]) * opp->RLI - params->srcLoc[currLinNum * totSrcInLine + m][1]* opp->SI; // hy
+
+					params->offSet[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count] =(sqrt(powf(offsetx, 2) + powf(offsety, 2)));//offset
+
+					azimuth = (atan2(offsety, offsetx) * radtodeg);
+
+					params->aziMuth[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count] =(azimuth < 0 ? azimuth + 360 : azimuth); // Azimuth
+
+					//*** Change the binning information *********************************
+					ih = floor(params->offSet[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count] / params->dh);
+					imx = floor(params->cmpXVal[currLinNum * totSrcInLine * params->tempNRL* params->tempNR	+ m * (params->tempNRL * params->tempNR) + count] / gpp->binX);
+					imy = floor(params->cmpY[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count] / gpp->binY);
+					iaz = floor(params->aziMuth[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count] / params->daz);
+
+					ih = (ih>=params->offsetDim)?params->offsetDim-1:ih;
+
+					if(gpp->simXmax<params->offSet[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count])
+						gpp->simXmax = params->offSet[currLinNum * totSrcInLine * params->tempNRL* params->tempNR+ m * (params->tempNRL * params->tempNR) + count];
+
+					if (params->binning[imx][imy][ih][iaz] == 0)
+					{
+						params->binning[imx][imy][ih][iaz] = 1;
+						params->cmpOffsetBinPopulate++;
+
+						// Turn off this trace located in different patches ***********/
+						for(int q=0; q<params->totPatches; q++)
+						{
+							endWinX = (params->patchTrack[q][0]+2*params->winX-1-params->olapX)<params->binDimX?(params->patchTrack[q][0]+params->winX):params->binDimX;
+							endWinY = (params->patchTrack[q][1]+2*params->winY-1-params->olapY)<params->binDimY?(params->patchTrack[q][1]+params->winY):params->binDimY;
+							endOffset = (params->patchTrack[q][2]+2*params->winHx-1-params->olapHx)<params->offsetDim?(params->patchTrack[q][2]+params->winHx):params->offsetDim;
+							endAz = (params->patchTrack[q][3]+2*params->winAz-1-params->olapAz)<params->azDim?(params->patchTrack[q][3]+params->winAz):params->azDim;
+
+							if(imx>endWinX && imy>endWinY && ih>endOffset && iaz>endAz)
+								break;
+							if((imx >= params->patchTrack[q][0] && imx < endWinX) && (imy >= params->patchTrack[q][1] && imy < endWinY) && (ih >= params->patchTrack[q][2] && ih < endOffset)&& (iaz >= params->patchTrack[q][3] && iaz < endAz))
+							{
+								params->patch4D[q][imx-params->patchTrack[q][0]][imy-params->patchTrack[q][1]][ih-params->patchTrack[q][2]][iaz-params->patchTrack[q][3]] = 1;
+								maxPatchNum = (maxPatchNum<q)?q:maxPatchNum;
+								minPatchNum = (minPatchNum>q)?q:minPatchNum;
+							}
+						}// End Turn off this trace located in different patches ***********/
+					}
+					//*** END of Changing the binning information **************************//
+					count++;
+				}
+			}
+			// Here we don't need to change the receiver line number. We are changing the receiver number for every source position.
+			params->firstLocRecTem[currLinNum * totSrcInLine + m][1] =params->firstLocRecTem[currLinNum * totSrcInLine][1];
+		}
+
+		// ** Computing Mutual coherency *************************//
+		for(int z=minPatchNum; z<=maxPatchNum; z++)
+		{
+			countPopBin = computeMutualCoh(params->patch4D[z], rpp->mu, z);
+			// Computing grid density for every patch ************//
+			rpp->simGridDensity[z] =(float) countPopBin/(params->patch4D[z].size()*params->patch4D[z][0].size()*params->patch4D[z][0][0].size()*params->patch4D[z][0][0][0].size());
+		}
+
+		for(int z=0; z<params->totPatches; z++)
+		{
+			sumMu += rpp->mu[z];
+			sumGridDensity += rpp->simGridDensity[z];
+		}
+
+		// Computing average mutual coherency *******************
+		rpp->avgMu = sumMu/params->totPatches;
+
+		// Computing average grid density ***********************
+		rpp->avgGridDensity = sumGridDensity/params->totPatches;
+	}
+
+	//** For the perturbation of one receiver line in the acquisition design
+	else {
+		count = 0;
+		indx = 0;
+		for (i = 0; i < params->totSrc; i++) {
+			for (unsigned int j = 0; j < params->cmpX[i].size(); j++) {
+
+				if (params->cmpX[i][j][1] == currLinNum) {
+
+					// Turn off the previous trace in that bin *************/
+					ih = floor(params->offSet[indx + j] / params->dh);
+					imx = floor(params->cmpXVal[indx + j] / gpp->binX);
+					imy = floor(params->cmpY[indx + j] / gpp->binY);
+					iaz = floor(params->aziMuth[indx + j] / params->daz);
+
+					ih = (ih>=params->offsetDim)?params->offsetDim-1:ih;
+
+					if (params->binning[imx][imy][ih][iaz] == 1)
+					{
+						params->binning[imx][imy][ih][iaz] = 0;
+						params->cmpOffsetBinPopulate--;
+						// END Turn off the previous trace in that bin *********/
+
+						// Turn off this trace located in different patches ***********/
+						for(int q=0; q<params->totPatches; q++)
+						{
+							endWinX = (params->patchTrack[q][0]+2*params->winX-1-params->olapX)<params->binDimX?(params->patchTrack[q][0]+params->winX):params->binDimX;
+							endWinY = (params->patchTrack[q][1]+2*params->winY-1-params->olapY)<params->binDimY?(params->patchTrack[q][1]+params->winY):params->binDimY;
+							endOffset = (params->patchTrack[q][2]+2*params->winHx-1-params->olapHx)<params->offsetDim?(params->patchTrack[q][2]+params->winHx):params->offsetDim;
+							endAz = (params->patchTrack[q][3]+2*params->winAz-1-params->olapAz)<params->azDim?(params->patchTrack[q][3]+params->winAz):params->azDim;
+
+							if(imx>endWinX && imy>endWinY && ih>endOffset && iaz>endAz)
+								break;
+
+							if((imx >= params->patchTrack[q][0] && imx < endWinX) && (imy >= params->patchTrack[q][1] && imy < endWinY) && (ih >= params->patchTrack[q][2] && ih < endOffset)&& (iaz >= params->patchTrack[q][3] && iaz < endAz))
+							{
+								params->patch4D[q][imx-params->patchTrack[q][0]][imy-params->patchTrack[q][1]][ih-params->patchTrack[q][2]][iaz-params->patchTrack[q][3]] = 0;
+								maxPatchNum = (maxPatchNum<q)?q:maxPatchNum;
+								minPatchNum = (minPatchNum>q)?q:minPatchNum;
+							}
+						}// End Turn off this trace located in different patches ***********/
+					}
+
+					params->cmpX[i][j][0] =	(((params->srcLoc[i][0] * opp->SLI+ opp->initSlOffset)+ (params->recLoc[currLinNum * totRecInLine+ (int) params->cmpX[i][j][2]][1])* opp->RI) / 2); // CMPX
+
+					params->cmpXVal[indx + j] =(((params->srcLoc[i][0] * opp->SLI+ opp->initSlOffset)+ (params->recLoc[currLinNum * totRecInLine+ (int) params->cmpX[i][j][2]][1])* opp->RI) / 2);  // CMP-Y
+
+					params->cmpY[indx + j] = ((params->srcLoc[i][1] * opp->SI+ (params->recLoc[currLinNum * totRecInLine+ (int) params->cmpX[i][j][2]][0])* opp->RLI) / 2);  // CMP-Y
+
+                    offsetx = (params->recLoc[currLinNum * totRecInLine+ (int) params->cmpX[i][j][2]][1])	* opp->RI - (params->srcLoc[i][0] * opp->SLI+ opp->initSlOffset);  // hx
+
+                    offsety = (params->recLoc[currLinNum * totRecInLine	+ (int) params->cmpX[i][j][2]][0])* opp->RLI - params->srcLoc[i][1] * opp->SI;  // hy
+
+					params->offSet[indx+j] = (sqrtf(powf(offsetx, 2) + powf(offsety, 2)));		//offset
+
+					azimuth = (atan2(offsety, offsetx) * radtodeg);
+
+					params->aziMuth[indx+j] = (azimuth < 0 ? azimuth + 360 : azimuth); // Azimuth
+
+					//*** Change the binning information *********************************
+					ih = floor(params->offSet[indx + j] / params->dh);
+					imx = floor(params->cmpXVal[indx + j] / gpp->binX);
+					imy = floor(params->cmpY[indx + j] / gpp->binY);
+					iaz = floor(params->aziMuth[indx + j] / params->daz);
+
+					ih = (ih>=params->offsetDim)?params->offsetDim-1:ih;
+
+					if(gpp->simXmax<params->offSet[indx+j])
+						gpp->simXmax = params->offSet[indx+j];
+
+					if (params->binning[imx][imy][ih][iaz] == 0)
+					{
+						params->binning[imx][imy][ih][iaz] = 1;
+						params->cmpOffsetBinPopulate++;
+						//*** END of Changing the binning information ***********************/
+
+						// Turn on this trace located in different patches ***********/
+						for(int q=0; q<params->totPatches; q++)
+						{
+							endWinX = (params->patchTrack[q][0]+2*params->winX-1-params->olapX)<params->binDimX?(params->patchTrack[q][0]+params->winX):params->binDimX;
+							endWinY = (params->patchTrack[q][1]+2*params->winY-1-params->olapY)<params->binDimY?(params->patchTrack[q][1]+params->winY):params->binDimY;
+							endOffset = (params->patchTrack[q][2]+2*params->winHx-1-params->olapHx)<params->offsetDim?(params->patchTrack[q][2]+params->winHx):params->offsetDim;
+							endAz = (params->patchTrack[q][3]+2*params->winAz-1-params->olapAz)<params->azDim?(params->patchTrack[q][3]+params->winAz):params->azDim;
+
+							if(imx>endWinX && imy>endWinY && ih>endOffset && iaz>endAz)
+								break;
+
+							if((imx >= params->patchTrack[q][0] && imx < endWinX) && (imy >= params->patchTrack[q][1] && imy < endWinY) && (ih >= params->patchTrack[q][2] && ih < endOffset) && (iaz >= params->patchTrack[q][3] && iaz < endAz))
+							{
+								params->patch4D[q][imx-params->patchTrack[q][0]][imy-params->patchTrack[q][1]][ih-params->patchTrack[q][2]][iaz-params->patchTrack[q][3]] = 1;
+								maxPatchNum = (maxPatchNum<q)?q:maxPatchNum;
+								minPatchNum = (minPatchNum>q)?q:minPatchNum;
+							}
+
+						}// End Turn on this trace located in different patches ***********/
+					}
+					count++;
+				}
+			}
+			indx += params->cmpX[i].size();
+			if (count >= totRecInLine)
+				break;
+		}
+
+		// ** Computing Mutual coherency *************************//
+		for(int z=minPatchNum; z<=maxPatchNum; z++)
+		{
+			countPopBin = computeMutualCoh(params->patch4D[z], rpp->mu, z);
+			// Computing grid density for every patch ************//
+			rpp->simGridDensity[z] =(float) countPopBin/(params->patch4D[z].size()*params->patch4D[z][0].size()*params->patch4D[z][0][0].size()*params->patch4D[z][0][0][0].size());
+		}
+
+		for(int z=0; z<params->totPatches; z++)
+		{
+			sumMu += rpp->mu[z];
+			sumGridDensity += rpp->simGridDensity[z];
+		}
+
+		// Computing average mutual coherency *******************//
+		rpp->avgMu = sumMu / params->totPatches;
+
+		// Computing average grid density ***********************//
+		rpp->avgGridDensity = sumGridDensity / params->totPatches;
+	}
+}
+
+//*** Compute 4D binning based on the CMPOffset domain *********/
+void Survey::computeBinning(Params* params, GeophyParams* gpp, ReconstructParams* rpp)
+{
+	int ih, imx, imy, iaz, count = 0;
+	params->binDimX = ceil(params->surveySizeX / gpp->binX);
+	params->binDimY = ceil(params->surveySizeY / gpp->binY);
+	params->azDim = 360 / params->daz;
+	gpp->simXmax = *std::max_element(params->offSet.begin(),params->offSet.end());
+
+	//*** 0.1 is added to solve the indexing problem *****************************/
+	params->offsetDim = ceil((gpp->simXmax + 0.1) / params->dh);
+	params->cmpOffsetBinSize = params->binDimX * params->binDimY * params->offsetDim * params->azDim;
+
+	// Allocating memory for binning *********************************************/
+	params->binning = alloc4DPointer(params->binDimX, params->binDimY, params->offsetDim, params->azDim, params->binning);
+
+	// Binning the cmp-offset domain**********************************************/
+	for (unsigned int i = 0; i < params->offSet.size(); i++) {
+		ih = floor(params->offSet[i] / params->dh);
+		imx = floor(params->cmpXVal[i] / gpp->binX);
+		imy = floor(params->cmpY[i] / gpp->binY);
+		iaz = floor(params->aziMuth[i] / params->daz);
+
+		// Checking the bin is populated earlier ********************************/
+		if (params->binning[imx][imy][ih][iaz] == 0) {
+			params->binning[imx][imy][ih][iaz] = 1;
+			count++;
+		}
+	}
+	params->cmpOffsetBinPopulate = count;
+}
+
+//*** Compute 5D patch **********************************************************/
+void Survey::computePatch(Params* params, GeophyParams* gpp, ReconstructParams* rpp, int flag)
+{
+	int spatialWindowNum[4];
+	int j, k, l, m, countPatch, initCmpX, initCmpY, initOffset, initAzimuth, n,	p, q, r;
+	int endCmpX, endCmpY, endOffset, endAzimuth, countPopBin, countBinx,countBiny, countHx;
+	float sumMu = 0.0, sumGridDensity = 0.0;
+
+	// Compute the number of patches in 4 spatial window directions *************/
+	spatialWindowNum[0] = floor((params->binDimX - params->olapX) / (params->winX - params->olapX)); 		// CMPX
+	spatialWindowNum[1] = floor((params->binDimY - params->olapY) / (params->winY - params->olapY)); 		// CMPY
+	spatialWindowNum[2] = floor((params->offsetDim - params->olapHx) / (params->winHx - params->olapHx));  // OFFSET
+	spatialWindowNum[3] = floor((params->azDim - params->olapAz) / (params->winAz - params->olapAz));		// AZIMUTH
+	params->totPatches = spatialWindowNum[0] * spatialWindowNum[1] * spatialWindowNum[2] * spatialWindowNum[3];
+	countPatch = 0;
+
+	std::cout << params->totPatches <<std::endl;
+
+	rpp->mu = NULL;
+	rpp->simGridDensity = NULL;
+
+	rpp->mu = new float[params->totPatches];
+	rpp->simGridDensity = new float[params->totPatches];
+	params->patchTrack.reserve(params->totPatches);
+	params->patch4D.reserve(params->totPatches);
+
+	//** Computing 4D patches from binning *************************************/
+		for (j = 0; j < spatialWindowNum[0]; j++) {
+			for (k = 0; k < spatialWindowNum[1]; k++) {
+				for (l = 0; l < spatialWindowNum[2]; l++) {
+					for (m = 0; m < spatialWindowNum[3]; m++) {
+						countPopBin = 0;
+						params->patch4D.push_back(std::vector<std::vector<std::vector<std::vector<int> > > >());
+						params->patchTrack.push_back(std::vector<int>());
+						params->patchTrack[countPatch].reserve(4);
+						initCmpX = j * (params->winX - params->olapX);
+						if (spatialWindowNum[0] == j + 1)
+							endCmpX = params->binDimX - 1;
+						else
+							endCmpX = initCmpX + params->winX - 1;
+
+						initCmpY = k * (params->winY - params->olapY);
+
+						if (spatialWindowNum[1] == k + 1)
+							endCmpY = params->binDimY - 1;
+						else
+							endCmpY = initCmpY + params->winY - 1;
+
+						initOffset = l * (params->winHx - params->olapHx);
+						if (spatialWindowNum[2] == l + 1)
+							endOffset = params->offsetDim - 1;
+						else
+							endOffset = initOffset + params->winHx - 1;
+
+						initAzimuth = m * (params->winAz - params->olapAz);
+
+						if (spatialWindowNum[3] == m + 1)
+							endAzimuth = params->azDim - 1;
+						else
+							endAzimuth = initAzimuth + params->winAz - 1;
+
+						params->patchTrack[countPatch].push_back(initCmpX);
+						params->patchTrack[countPatch].push_back(initCmpY);
+						params->patchTrack[countPatch].push_back(initOffset);
+						params->patchTrack[countPatch].push_back(initAzimuth);
+						params->patch4D[countPatch].reserve(endCmpX - initCmpX+1);
+
+						countBinx = -1;
+						for (n = initCmpX; n <= endCmpX; n++) {
+							countBinx++;
+							countBiny = -1;
+							params->patch4D[countPatch].push_back(std::vector<std::vector<std::vector<int> > >());
+							params->patch4D[countPatch][countBinx].reserve(endCmpY - initCmpY+1);
+							//tempPatchData.push_back(std::vector<std::vector<std::vector<int> > >());
+							for (p = initCmpY; p <= endCmpY; p++) {
+								countBiny++;
+								countHx = -1;
+								params->patch4D[countPatch][countBinx].push_back(std::vector<std::vector<int> >());
+								params->patch4D[countPatch][countBinx][countBiny].reserve(endOffset - initOffset+1);
+								//tempPatchData[countBinx].push_back(std::vector<std::vector<int> >());
+								for (q = initOffset; q <= endOffset; q++) {
+									countHx++;
+									params->patch4D[countPatch][countBinx][countBiny].push_back(std::vector<int>());
+									params->patch4D[countPatch][countBinx][countBiny][countHx].reserve(endAzimuth - initAzimuth+1);
+									//tempPatchData[countBinx][countBiny].push_back(std::vector<int>());
+									for (r = initAzimuth; r <= endAzimuth; r++) {
+										params->patch4D[countPatch][countBinx][countBiny][countHx].push_back(params->binning[n][p][q][r]);
+										//tempPatchData[countBinx][countBiny][countHx].push_back(params->binning[n][p][q][r]);
+									}
+								}
+							}
+						}
+						countPopBin = computeMutualCoh(params->patch4D[countPatch], rpp->mu, countPatch);
+						sumMu += rpp->mu[countPatch];
+
+						// Computing grid density for every patch *******************
+						rpp->simGridDensity[countPatch] =(float) countPopBin/(params->patch4D[countPatch].size()*params->patch4D[countPatch][0].size()*params->patch4D[countPatch][0][0].size()*params->patch4D[countPatch][0][0][0].size());
+						sumGridDensity += rpp->simGridDensity[countPatch];
+						countPatch++;
+					}
+				}
+			}
+		}	// End of making 4D patch
+		if(flag == 0)
+		{
+			rpp->initMu = new float[params->totPatches];
+			rpp->initSimGridDensity = new float[params->totPatches];
+			for(int i=0; i<params->totPatches; i++)
+			{
+				rpp->initMu[i] = rpp->mu[i];
+				rpp->initSimGridDensity[i] = rpp->simGridDensity[i];
+			}
+
+		}
+
+		// Computing average mutual coherency *******************
+		rpp->avgMu = sumMu / params->totPatches;
+		std::cout << sumMu << std::endl;
+
+		// Computing average grid density ***********************
+		rpp->avgGridDensity = sumGridDensity / params->totPatches;
+	}
+
+	//**** Evaluate the fitness value of the cost function ************************/
+	float Survey::evalFitness(Params* params, GeophyParams* gpp,ReconstructParams* rpp, int minRLI, float RLI, int minSLI, float SLI, int outLoopCount)
+	{
+		float fitness = 0.0, normXmin, normXmax, normGridDensity;
+		int densityCount = 0;
+		float normGridEfficiency;
+
+		//gpp->simXmin = sqrtf(powf(maxRLI * RLI, 2) + powf(maxSLI * SLI, 2));
+
+		gpp->simXmin = sqrtf(powf(minRLI * RLI, 2) + powf(minSLI * SLI, 2));
+
+		// Computing critical mutual coherency **********************************/
+		rpp->simCriticalMu = standardization(rpp->mu, rpp->avgMu,params->totPatches);
+
+		// Computing critical grid density **************************************/
+		for (int i = 0; i < params->totPatches; i++) {
+			if (rpp->simGridDensity[i] < rpp->desiredGridDensity)
+				densityCount++;
+		}
+		rpp->simCriticGridDensity = (float) (densityCount / params->totPatches);
+
+		// Computing normalised simulated tempGridDensity ***********************/
+		params->tempGridDensity = ((rpp->desiredGridDensity - rpp->avgGridDensity)/ rpp->desiredGridDensity);
+
+		// Computing normalised simulated GridDensity ***************************/
+		normGridDensity =powf((((params->tempGridDensity + params->theta[outLoopCount][5])> 0.0) ? params->tempGridDensity : 0.0), 2);
+
+		// Computing simulated grid efficiency **********************************/
+		rpp->simGridEfficiency = (float) params->cmpOffsetBinPopulate/params->offSet.size();
+
+		// Computing normalised simulated grid Efficiency ***********************/
+		params->normGridEfficiency = ((rpp->desiredGridEfficiency- rpp->simGridEfficiency) / rpp->desiredGridEfficiency);
+
+		normGridEfficiency = powf((params->normGridEfficiency + params->theta[outLoopCount][4]), 2);
+
+		// Computing normalised simulated Xmax **********************************/
+		params->tempNormMax = ((gpp->desXmax - gpp->simXmax) / gpp->desXmax);
+		params->tempNormMax = (fabs(params->tempNormMax)>1.0)?(params->tempNormMax/fabs(params->tempNormMax)):params->tempNormMax;
+
+		normXmax = powf((((params->tempNormMax + params->theta[outLoopCount][3]) > 0.0)?params->tempNormMax : 0.0), 2);
+
+		// Computing normalised simulated Xmin **********************************/
+		params->tempNormMin = (((gpp->desXmin - gpp->simXmin) / gpp->desXmin));
+		params->tempNormMin = (fabs(params->tempNormMin)>1.0)?(params->tempNormMin/fabs(params->tempNormMin)):params->tempNormMin;
+
+		normXmin = powf((((params->tempNormMin + params->theta[outLoopCount][2]) < 0.0)?fabs(params->tempNormMax) : 0.0), 2);
+
+		// Evaluate the fitness function ****************************************/
+		fitness =rpp->avgMu	+ 0.5*(params->gamma[0]* powf((rpp->simCriticalMu+ params->theta[outLoopCount][0]),2)+
+							 params->gamma[1]* powf((rpp->simCriticGridDensity+ params->theta[outLoopCount][1]),2)+
+							 params->gamma[2] * normXmin+params->gamma[3] * normXmax+params->gamma[4]*normGridEfficiency+
+							 params->gamma[5] * normGridDensity);
+
+		return fitness;
+	}
+
+	//******* Compute mutual Coherency for every patch in cmp-offset grid ***************************/
+	long Survey::computeMutualCoh(std::vector<std::vector<std::vector<std::vector<int> > > >&patch, float *mu, int patchNum)
+	{
+		int n[4], j, k, l;
+		long int lexDim , popBinCount = 0;
+		float maxCoeff, muCoherency=-10000.0, dataOut;
+		fftw_plan p1;
+		fftw_complex *data;
+
+		n[0] = patch.size();
+		n[1] = patch[0].size();
+		n[2] = patch[0][0].size();
+		n[3] = patch[0][0][0].size();
+
+		// Dimensions of the 4D spatial cases //
+		data = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * n[0] * n[1] * n[2] * n[3]);
+
+		for (j = 0; j < n[0]; j++)
+			for (k = 0; k < n[1]; k++)
+				for (l = 0; l < n[2]; l++)
+					for (int m = 0; m < n[3]; m++)
+					{
+						if(patch[j][k][l][m] == 1)
+							popBinCount++;
+						data[j * n[1] * n[2] * n[3] + k * n[2] * n[3] + l * n[3] + m] = (double) patch[j][k][l][m]+ 0.0*I;
+					}
+
+		p1 = fftw_plan_dft(4, n, data, data, FFTW_FORWARD, FFTW_ESTIMATE);
+		fftw_execute(p1);
+		maxCoeff = sqrtf(powf(crealf(data[0]), 2.0) + powf(cimagf(data[0]), 2.0));
+		lexDim = n[0] * n[1] * n[2] * n[3];
+
+		for(j = 1; j < lexDim; j++)
+		{
+			dataOut = (sqrtf(powf(crealf(data[j]), 2) + powf(cimagf(data[j]), 2))/maxCoeff);
+			if (muCoherency < dataOut)
+				muCoherency = dataOut;
+		}
+		mu[patchNum] = (maxCoeff<=0.0)?1.0:muCoherency;
+		fftw_free(data);
+		data = NULL;
+		fftw_destroy_plan(p1);
+
+		return popBinCount;
+	}
+
+	// Write binary file for the optimised sources' and receivers' locations ****** //
+	void Survey::write2Ddata(std::string fileName, int n1, int n2, int **data)
+	{
+		int i, j;
+		std::ofstream output;
+		std::cout << fileName <<std::endl;
+		output.open(fileName.c_str(), ios::out);
+
+		try
+		{
+			if(n2==2)
+			{
+				output<<"Source Number";
+				output<<",";
+				output<<"Receiver line Number";
+				output<<",";
+				output<<"Receiver Number";
+				output<<"\n";
+			}
+
+			for(i=0; i<n1; i++)
+			{
+				if(n2==2)
+				{
+					output<<i+1;
+					output<<",";
+					output<<data[i][0]+1;
+					output<<",";
+					output<<data[i][1]+1;
+				}
+				else
+					for(j=0; j<n2; j++)
+					{
+						output<<data[i][j];
+						if(j<n2-1)
+							output<<",";
+					}
+				output<<"\n";
+			}
+			output.close();
+		}
+		catch (int n)
+		{
+			std::cout <<"ERROR: " << n <<std::endl;
+		}
+	}
+
+	// Write binary file for the optimised sources' and receivers' locations ****** //
+	void Survey::write1Ddata(std::string fileName, int n1, float *data)
+	{
+		int i;
+		std::ofstream output1 (fileName.c_str());
+		std::cout << fileName <<std::endl;
+		try
+		{
+			for(i=0; i<n1; i++)
+			{
+				output1<<data[i];
+				output1<<"\n";
+			}
+		}
+		catch (int n)
+		{
+			std::cout <<"ERROR: " << n <<std::endl;
+		}
+	}
+
+
+	// Write binary file for the optimised sources' and receivers' locations ****** //
+	void Survey::writeDdata(std::string fileName, Params* params, GeophyParams* gpp, ReconstructParams* rpp, int flag )
+	{
+		std::ofstream output1 (fileName.c_str());
+
+		std::cout << fileName <<std::endl;
+
+		if(flag == 1)
+		{
+			output1<<"Number of receiver in Template: " << params->tempNR*params->tempNRL;
+			output1<<"\n";
+			output1<<"Number of receiver line in Template: " << params->tempNRL;
+			output1<<"\n";
+			output1<<"Simulated Maximum offset: " << gpp->simXmax;
+			output1<<"\n";
+			output1<<"Simulated Largest minimum offset: " << gpp->simXmin;
+			output1<<"\n";
+			output1<<"Simulated grid efficiency: " << rpp->simGridEfficiency;
+			output1<<"\n";
+		}
+		else
+		{
+			for(int i=0; i<params->finalCons.size(); i++)
+			{
+				output1<<params->finalCons[i];
+				output1<<"\n";
+			}
+		}
+	}
