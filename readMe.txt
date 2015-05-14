@@ -23,15 +23,19 @@ Make sure the path of FFTW plug-in is correct.
 
 Running
 =======
-Before running, check the input parameters in input.txt file. Input.txt file contains the dimensions of 3D curvelet  
-transformation. 
+From optSurvey directory in terminal run the following commands: 
 
 1. cd Debug
 2. make clean 
 3. make all 
-4. ./fdct3d 
+4. ./optSurvey 
+
+Output
+======
+The program will generate and write several output file in Debug directory. Please check the files for the final results 
+and convergence of the algorithm.
 
 
 That's all. 
 
-Please contact: mbhuiyan@ualberta.ca
+Please contact: mbhuiyan@ualberta.ca for further inquiries. 
